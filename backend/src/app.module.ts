@@ -20,19 +20,14 @@ import { AdminModule } from './modules/admin/admin.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { UploadsModule } from './modules/uploads/uploads.module';
 import { TelegramModule } from './modules/telegram/telegram.module';
-import validationSchema from './config/validation.schema';
 
 @Module({
   imports: [
     // ── Configuration (loads .env) ─────────────────────────────────────────
-  ConfigModule.forRoot({
-  isGlobal: true,
-  validationSchema,
-  validationOptions: {
-    allowUnknown: true,
-    abortEarly: false,
-  },
-}),
+    ConfigModule.forRoot({
+      isGlobal: true,
+      envFilePath: ['.env.local', '.env'],
+    }),
 
     // ── Rate limiting ──────────────────────────────────────────────────────
     ThrottlerModule.forRoot([
@@ -73,21 +68,9 @@ import validationSchema from './config/validation.schema';
     AuthModule,
     UsersModule,
     JobsModule,
-    ApplicationsModule.register({
-  enableAiScreening: true,
-  enableRecruiterNotifications: true,
-}),
-ScreeningModule.register({
-  openaiApiKey: process.env.OPENAI_API_KEY!,
-  openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-  minScoreForShortlist: parseInt(process.env.MIN_SCORE_SHORTLIST || '70', 10),
-  enableAutoInterview: process.env.ENABLE_AUTO_INTERVIEW === 'true',
-}),
-NotificationsModule.register({
-  enableTelegram: true,
-  enableEmail: true,
-  enableInApp: true,
-}),
+    ApplicationsModule,
+    ScreeningModule,
+    NotificationsModule,
     AnalyticsModule,
     FreelanceModule,
     EscrowModule,

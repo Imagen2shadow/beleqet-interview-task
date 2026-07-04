@@ -1,12 +1,8 @@
 {
   "compilerOptions": {
     "module": "commonjs",
-    "include": ["src/**/*", "src/@types/**/*"]
     "declaration": true,
     "removeComments": true,
-    "types": ["node", "jest"],
-    "typeRoots": ["node_modules/@types"]
-    "skipLibCheck": true
     "emitDecoratorMetadata": true,
     "experimentalDecorators": true,
     "allowSyntheticDefaultImports": true,

@@ -1,5 +1,5 @@
 # Build stage
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -8,13 +8,11 @@ RUN apk add --no-cache openssl
 COPY package*.json ./
 COPY prisma ./prisma/
 
-RUN npm install --legacy-peer-deps
+RUN npm ci
 
 COPY . .
 
 RUN npm run prisma:generate
-RUN npm install typescript@4.9.5 --save-dev --legacy-peer-deps
-RUN npm install @types/bull --save-dev --legacy-peer-deps
 RUN npm run build
 
 # Production stage

@@ -1,60 +1,47 @@
-import {
-  Controller, Post, Get, Patch, Body, Param, UseGuards,
-  HttpCode, HttpStatus,
-} from '@nestjs/common';
+import { Controller, Post, Get, Patch, Body, Param, UseGuards } from '@nestjs/common';
+import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../../common/guards/roles.guard';
-import { Roles } from '../../common/decorators/roles.decorator';
-import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { CurrentUser, CurrentUserPayload } from '../../common/decorators/current-user.decorator';
 import { ApplicationsService } from './applications.service';
-import { SubmitApplicationDto } from './dto/submit-application.dto';
-import { UpdateStatusDto } from './dto/update-status.dto';
+import { CreateApplicationDto, UpdateApplicationStatusDto } from './dto/create-application.dto';
 
-@Controller('applications')
+@ApiTags('applications')
+@ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
+@Controller('applications')
 export class ApplicationsController {
-  constructor(private readonly applicationsService: ApplicationsService) {}
+  constructor(private readonly svc: ApplicationsService) {}
 
   @Post()
-  @HttpCode(HttpStatus.CREATED)
-  async submit(
-    @CurrentUser('userId') userId: string,
-    @Body() dto: SubmitApplicationDto,
-  ) {
-    return this.applicationsService.submit(userId, dto);
+  @ApiOperation({ summary: 'Submit a job application — triggers AI screening workflow' })
+  submit(@CurrentUser() user: CurrentUserPayload, @Body() dto: CreateApplicationDto) {
+    return this.svc.submit(user.userId, dto);
   }
 
   @Get('my')
-  async getMyApplications(@CurrentUser('userId') userId: string) {
-    return this.applicationsService.findByUser(userId);
+  @ApiOperation({ summary: 'Get all applications for the current user' })
+  myApplications(@CurrentUser() user: CurrentUserPayload) {
+    return this.svc.findByUser(user.userId);
   }
 
-  @Get('job/:id')
-  @UseGuards(RolesGuard)
-  @Roles('EMPLOYER', 'ADMIN')
-  async getJobApplications(
-    @Param('id') jobId: string,
-    @CurrentUser('userId') userId: string,
-  ) {
-    return this.applicationsService.findByJob(jobId, userId);
+  @Get('job/:jobId')
+  @ApiOperation({ summary: 'Get all applications for a job (employer only)' })
+  byJob(@Param('jobId') jobId: string, @CurrentUser() user: CurrentUserPayload) {
+    return this.svc.findByJob(jobId, user.userId);
   }
 
   @Get(':id')
-  async getById(
-    @Param('id') id: string,
-    @CurrentUser('userId') userId: string,
-  ) {
-    return this.applicationsService.findOne(id, userId);
+  findOne(@Param('id') id: string) {
+    return this.svc.findOne(id);
   }
 
   @Patch(':id/status')
-  @UseGuards(RolesGuard)
-  @Roles('EMPLOYER', 'ADMIN')
-  async updateStatus(
+  @ApiOperation({ summary: 'Update application status (employer action)' })
+  updateStatus(
     @Param('id') id: string,
-    @Body() dto: UpdateStatusDto,
-    @CurrentUser('userId') userId: string,
+    @Body() dto: UpdateApplicationStatusDto,
+    @CurrentUser() user: CurrentUserPayload
   ) {
-    return this.applicationsService.updateStatus(id, dto, userId);
+    return this.svc.updateStatus(id, dto.status, user.userId);
   }
 }

@@ -1,113 +1,121 @@
-import { Injectable, Inject, NotFoundException, ForbiddenException } from '@nestjs/common';
+import {
+  Injectable, NotFoundException, ConflictException, Logger,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
-import { QUEUE_NAMES, APPLICATION_JOBS } from '../queues/queues.constants';
-import { ApplicationsModuleOptions } from './applications.module';
-import { SubmitApplicationDto } from './dto/submit-application.dto';
-import { UpdateStatusDto } from './dto/update-status.dto';
+import { CreateApplicationDto } from './dto/create-application.dto';
+import { QUEUE_NAMES, APPLICATION_JOBS, ANALYTICS_JOBS } from '../queues/queues.constants';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 
 @Injectable()
 export class ApplicationsService {
+  private readonly logger = new Logger(ApplicationsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
-    @InjectQueue(QUEUE_NAMES.APPLICATION) private readonly applicationQueue: Queue,
-    @InjectQueue(QUEUE_NAMES.ANALYTICS) private readonly analyticsQueue: Queue,
-    @Inject('APPLICATIONS_CONFIG') private readonly config: ApplicationsModuleOptions,
+    private readonly eventEmitter: EventEmitter2,
+    @InjectQueue(QUEUE_NAMES.APPLICATION)
+    private readonly applicationQueue: Queue,
+    @InjectQueue(QUEUE_NAMES.ANALYTICS)
+    private readonly analyticsQueue: Queue,
   ) {}
 
-  async submit(userId: string, dto: SubmitApplicationDto) {
-    // Check if user already applied
+  async submit(userId: string, dto: CreateApplicationDto) {
+    const job = await this.prisma.job.findFirst({
+      where: { id: dto.jobId, status: 'PUBLISHED' },
+      include: { company: true },
+    });
+    if (!job) {
+      throw new NotFoundException(`Job ${dto.jobId} not found or no longer accepting applications`);
+    }
+
     const existing = await this.prisma.application.findUnique({
       where: { jobId_userId: { jobId: dto.jobId, userId } },
     });
-
     if (existing) {
-      throw new ForbiddenException('You have already applied for this job');
+      throw new ConflictException('You have already applied to this job');
     }
 
-    // Get job details for screening
-    const job = await this.prisma.job.findUnique({
-      where: { id: dto.jobId },
-      include: { company: true },
-    });
-
-    if (!job) {
-      throw new NotFoundException('Job not found');
-    }
-
-    // Create application
-    const application = await this.prisma.application.create({
-      data: {
-        jobId: dto.jobId,
-        userId,
-        coverLetter: dto.coverLetter,
-        resumeUrl: dto.resumeUrl,
-        portfolioUrl: dto.portfolioUrl,
-        expectedSalary: dto.expectedSalary,
-        status: 'SUBMITTED',
-      },
-      include: {
-        job: true,
-        user: true,
-      },
-    });
-
-    // Queue AI screening if enabled
-    if (this.config.enableAiScreening) {
-      await this.applicationQueue.add(
-        APPLICATION_JOBS.SCREEN_CANDIDATE,
-        {
-          applicationId: application.id,
-          userId,
+    // Atomic create + event log
+    const application = await this.prisma.$transaction(async (tx: any) => {
+      const app = await tx.application.create({
+        data: {
           jobId: dto.jobId,
-          jobTitle: job.title,
-          jobDescription: job.description,
-          jobRequirements: job.requirements,
+          userId,
           coverLetter: dto.coverLetter,
           resumeUrl: dto.resumeUrl,
-          companyId: job.companyId,
+          status: 'SUBMITTED',
         },
-        {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 2000 },
-          removeOnComplete: 100,
+        include: {
+          user: { select: { id: true, firstName: true, lastName: true, email: true } },
+          job:  { select: { id: true, title: true, companyId: true } },
         },
-      );
-    }
+      });
 
-    // Queue recruiter notification if enabled
-    if (this.config.enableRecruiterNotifications) {
-      const user = await this.prisma.user.findUnique({ where: { id: userId } });
-      await this.applicationQueue.add(
-        APPLICATION_JOBS.NOTIFY_RECRUITER,
-        {
-          applicationId: application.id,
-          jobTitle: job.title,
-          companyId: job.companyId,
-          applicantName: `${user?.firstName ?? ''} ${user?.lastName ?? ''}`.trim(),
+      await tx.eventLog.create({
+        data: {
+          eventType: 'application.submitted',
+          entityId: app.id,
+          entityType: 'Application',
+          payload: {
+            applicationId: app.id,
+            jobId: dto.jobId,
+            userId,
+            jobTitle: job.title,
+            companyId: job.companyId,
+          },
+          processedBy: ApplicationsService.name,
         },
-        {
-          attempts: 3,
-          backoff: { type: 'fixed', delay: 1000 },
-        },
-      );
-    }
+      });
 
-    // Analytics event
-    await this.analyticsQueue.add('log-event', {
-      eventType: 'application.submitted',
-      entityId: application.id,
+      return app;
+    });
+
+    // Fire-and-forget: do not await Redis queues so the UI doesn't hang if Redis is down locally.
+    this.applicationQueue.add(
+      APPLICATION_JOBS.SCREEN_CANDIDATE,
+      {
+        applicationId: application.id,
+        userId,
+        jobId: dto.jobId,
+        jobTitle: job.title,
+        jobDescription: job.description,
+        jobRequirements: job.requirements,
+        coverLetter: dto.coverLetter,
+        resumeUrl: dto.resumeUrl,
+        companyId: job.companyId,
+      },
+      { priority: 1 },
+    ).catch(err => this.logger.error('Failed to enqueue SCREEN_CANDIDATE', err.message));
+
+    this.applicationQueue.add(
+      APPLICATION_JOBS.NOTIFY_RECRUITER,
+      {
+        applicationId: application.id,
+        jobId: dto.jobId,
+        jobTitle: job.title,
+        companyId: job.companyId,
+        applicantName: `${application.user.firstName} ${application.user.lastName}`,
+      },
+      { priority: 2 },
+    ).catch(err => this.logger.error('Failed to enqueue NOTIFY_RECRUITER', err.message));
+
+    this.analyticsQueue.add(
+      ANALYTICS_JOBS.UPDATE_JOB_STATS,
+      { jobId: dto.jobId }
+    ).catch(err => this.logger.error('Failed to enqueue UPDATE_JOB_STATS', err.message));
+
+    this.eventEmitter.emit('application.submitted', {
+      applicationId: application.id,
       jobId: dto.jobId,
       userId,
     });
 
-    return {
-      success: true,
-      message: 'Application submitted successfully',
-      applicationId: application.id,
-      status: application.status,
-    };
+    this.logger.log(`Application ${application.id} submitted — screening queued`);
+    return application;
   }
 
   async findByUser(userId: string) {
@@ -119,63 +127,44 @@ export class ApplicationsService {
   }
 
   async findByJob(jobId: string, employerId: string) {
-    const job = await this.prisma.job.findUnique({
-      where: { id: jobId },
-      include: { company: true },
+    const job = await this.prisma.job.findFirst({
+      where: { id: jobId, company: { userId: employerId } },
     });
-
-    if (!job || job.company?.userId !== employerId) {
-      throw new ForbiddenException('You do not have access to these applications');
-    }
+    if (!job) throw new NotFoundException('Job not found');
 
     return this.prisma.application.findMany({
       where: { jobId },
-      include: { user: true, score: true },
-      orderBy: { createdAt: 'desc' },
+      include: {
+        user: { select: { id: true, firstName: true, lastName: true, email: true, phone: true } },
+        score: true,
+      },
+      orderBy: [{ score: { overallScore: 'desc' } }, { createdAt: 'asc' }],
     });
   }
 
-  async findOne(id: string, userId: string) {
+  async findOne(id: string) {
     const application = await this.prisma.application.findUnique({
       where: { id },
-      include: { job: { include: { company: true } }, user: true, score: true },
+      include: { user: true, job: { include: { company: true } }, score: true },
     });
-
-    if (!application) {
-      throw new NotFoundException('Application not found');
-    }
-
-    const isOwner = application.userId === userId;
-    const isEmployer = application.job?.company?.userId === userId;
-
-    if (!isOwner && !isEmployer) {
-      throw new ForbiddenException('Access denied');
-    }
-
+    if (!application) throw new NotFoundException(`Application ${id} not found`);
     return application;
   }
 
-  async updateStatus(id: string, dto: UpdateStatusDto, employerId: string) {
-    const application = await this.prisma.application.findUnique({
-      where: { id },
-      include: { job: { include: { company: true } } },
+  async updateStatus(id: string, status: string, employerId: string) {
+    // 1. Verify the application exists AND belongs to a job owned by this employer
+    const application = await this.prisma.application.findFirst({
+      where: { id, job: { company: { userId: employerId } } },
     });
 
     if (!application) {
-      throw new NotFoundException('Application not found');
+      throw new NotFoundException(`Application ${id} not found or you don't have permission to update it`);
     }
 
-    if (application.job?.company?.userId !== employerId) {
-      throw new ForbiddenException('You can only update applications for your own jobs');
-    }
-
+    // 2. Update the status
     return this.prisma.application.update({
       where: { id },
-      data: {
-        status: dto.status as any,
-        notes: dto.notes,
-      },
-      include: { user: true, job: true },
+      data: { status: status as never },
     });
   }
 }
